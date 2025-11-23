@@ -1,11 +1,11 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use glob::glob;
-use include_dir::{Dir, include_dir};
+use glob::{glob, glob_with, MatchOptions};
+use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use serde_json;
 
@@ -294,15 +294,18 @@ fn load_skills(dir: &Path) -> Result<Vec<Skill>> {
     let mut skills = Vec::new();
 
     // Anthropic skills: **/SKILL.md (case-insensitive-ish)
-    for pattern in ["SKILL.md", "skill.md"] {
-        let md_pattern = dir.join("**").join(pattern);
-        for entry in glob(md_pattern.to_str().unwrap())
-            .with_context(|| format!("Failed to read glob for {}", pattern))?
-        {
-            let path = entry?;
-            if let Some(skill) = load_skill_md(&path)? {
-                skills.push(skill);
-            }
+    let md_pattern = dir.join("**").join("SKILL.md");
+    let glob_options = MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    for entry in glob_with(md_pattern.to_str().unwrap(), glob_options)
+        .with_context(|| "Failed to read glob for SKILL.md (case-insensitive)")?
+    {
+        let path = entry?;
+        if let Some(skill) = load_skill_md(&path)? {
+            skills.push(skill);
         }
     }
 
