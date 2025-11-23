@@ -6,6 +6,12 @@ Small CLI that routes tasks to skill playbooks stored as `SKILL.md` files. The b
 - From this repo: `cargo install --path . --force`
 - Confirm: `codex-skills list`
 
+## Build the binary
+- Release: `cargo build --release`
+- Debug (faster compile): `cargo build`
+- Binary output: `target/release/codex-skills` (or `target/debug/codex-skills`)
+- Run locally: `./target/release/codex-skills list`
+
 ## Quickstart (correct flag order)
 The global options (like `--skills-dir`) must appear **before** the subcommand.
 ```bash
