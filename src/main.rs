@@ -1,11 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use glob::glob;
 use include_dir::{Dir, include_dir};
 use serde::Deserialize;
+use serde_json;
 
 #[derive(Parser, Debug)]
 #[command(name = "skills", about = "Route tasks to the right skill playbook.")]
@@ -21,7 +23,20 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// List all available skills with a short summary
-    List,
+    List {
+        /// Output only names
+        #[arg(long)]
+        brief: bool,
+        /// Output full summaries (no clipping)
+        #[arg(long)]
+        verbose: bool,
+        /// Output JSON array of skill names
+        #[arg(long)]
+        json: bool,
+        /// Maximum characters for clipped summaries
+        #[arg(long, default_value_t = 80, value_name = "N")]
+        clip: usize,
+    },
 
     /// Suggest the best matching skills for a task description
     Pick {
@@ -58,6 +73,13 @@ struct Skill {
     summary: String,
     keywords: Vec<String>,
     doc: String,
+    extra_docs: Vec<ExtraDoc>,
+}
+
+#[derive(Debug, Clone)]
+struct ExtraDoc {
+    name: String,
+    contents: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,37 +88,6 @@ struct SkillFrontmatter {
     description: String,
     #[serde(default)]
     tags: Vec<String>,
-}
-
-impl Skill {
-    fn score(&self, query: &str) -> usize {
-        let q = query.to_lowercase();
-        let mut score = 0usize;
-        for word in q.split_whitespace() {
-            let w = word.trim();
-            if w.is_empty() {
-                continue;
-            }
-            let w_lower = w.to_lowercase();
-            if self.name.to_lowercase().contains(&w_lower) {
-                score += 4;
-            }
-            if self.summary.to_lowercase().contains(&w_lower) {
-                score += 3;
-            }
-            if self
-                .keywords
-                .iter()
-                .any(|k| k.to_lowercase().contains(&w_lower))
-            {
-                score += 2;
-            }
-            if self.doc.to_lowercase().contains(&w_lower) {
-                score += 1;
-            }
-        }
-        score
-    }
 }
 
 fn main() -> Result<()> {
@@ -124,18 +115,58 @@ fn main() -> Result<()> {
     }
 
     match command {
-        Command::List => {
+        Command::List { brief, verbose, json, clip } => {
+            if json {
+                let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+                let json = serde_json::to_string(&names)?;
+                println!("{}", json);
+                return Ok(());
+            }
+
             for skill in &skills {
-                println!("- {} — {}", skill.name, skill.summary);
+                if brief {
+                    println!("- {}", skill.name);
+                } else if verbose {
+                    println!("- {} — {}", skill.name, skill.summary);
+                } else {
+                    let clipped = clip_summary(&skill.summary, clip);
+                    println!("- {} — {}", skill.name, clipped);
+                }
             }
         }
         Command::Pick { query, top, show } => {
-            let mut ranked: Vec<(usize, &Skill)> =
-                skills.iter().map(|s| (s.score(&query), s)).collect();
+            let q_tokens = normalized_tokens(&query);
+            let mut ranked: Vec<(usize, &Skill, SkillSignals)> = skills
+                .iter()
+                .map(|s| {
+                    let signals = compute_signals(s, &q_tokens);
+                    (signals.total_score(), s, signals)
+                })
+                .collect();
             ranked.sort_by(|a, b| b.0.cmp(&a.0));
 
+            if let Some((best_score, best_skill, _)) = ranked.first() {
+                if *best_score == 0 {
+                    println!(
+                        "No good skill match for '{}'. Try a broader or simpler description.\nHint: skills available: {}",
+                        query,
+                        skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                    );
+                    return Ok(());
+                }
+                if show {
+                    println!(
+                        "Top match reasoning: name hits={}, summary hits={}, tag hits={}, body hits={}",
+                        compute_signals(best_skill, &q_tokens).name_hits,
+                        compute_signals(best_skill, &q_tokens).summary_hits,
+                        compute_signals(best_skill, &q_tokens).tag_hits,
+                        compute_signals(best_skill, &q_tokens).body_hits,
+                    );
+                }
+            }
+
             let mut shown = false;
-            for (idx, (score, skill)) in ranked.iter().take(top).enumerate() {
+            for (idx, (score, skill, signals)) in ranked.iter().take(top).enumerate() {
                 println!(
                     "{}. {} (score: {}) — {}",
                     idx + 1,
@@ -144,7 +175,18 @@ fn main() -> Result<()> {
                     skill.summary
                 );
                 if show && idx == 0 {
-                    println!("\n{}\n{}\n", separator(), skill.doc.trim());
+                    println!(
+                        "\n{}\n{}\n",
+                        separator(),
+                        skill.doc.trim()
+                    );
+                    println!(
+                        "Top match reasoning: name hits={}, summary hits={}, tag hits={}, body hits={}",
+                        signals.name_hits, signals.summary_hits, signals.tag_hits, signals.body_hits
+                    );
+                    for extra in &skill.extra_docs {
+                        println!("\n{} {}\n{}\n", separator(), extra.name, extra.contents.trim());
+                    }
                     shown = true;
                 }
             }
@@ -156,6 +198,9 @@ fn main() -> Result<()> {
         Command::Show { name } => {
             if let Some(skill) = find_skill(&skills, &name) {
                 println!("{}\n{}\n", separator(), skill.doc.trim());
+                for extra in &skill.extra_docs {
+                    println!("\n{} {}\n{}\n", separator(), extra.name, extra.contents.trim());
+                }
             } else {
                 println!(
                     "Skill '{}' not found. Use `skills list` to see available entries.",
@@ -170,6 +215,75 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct SkillSignals {
+    name_hits: usize,
+    summary_hits: usize,
+    tag_hits: usize,
+    body_hits: usize,
+}
+
+impl SkillSignals {
+    fn total_score(&self) -> usize {
+        const NAME_WEIGHT: usize = 8;
+        const SUMMARY_WEIGHT: usize = 5;
+        const TAG_WEIGHT: usize = 4;
+        const BODY_WEIGHT: usize = 1;
+
+        NAME_WEIGHT * self.name_hits
+            + SUMMARY_WEIGHT * self.summary_hits
+            + TAG_WEIGHT * self.tag_hits
+            + BODY_WEIGHT * self.body_hits
+    }
+}
+
+fn normalized_tokens(text: &str) -> Vec<String> {
+    let stopwords: HashSet<&'static str> = [
+        "the", "a", "an", "to", "and", "or", "for", "into", "with", "when", "of",
+        "use", "be", "is", "are", "on", "in", "at", "this", "that",
+    ]
+    .into_iter()
+    .collect();
+
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter_map(|w| {
+            let word = w.trim();
+            if word.is_empty() || stopwords.contains(word) {
+                None
+            } else {
+                Some(word.to_string())
+            }
+        })
+        .collect()
+}
+
+fn overlap(query_tokens: &[String], target_tokens: &[String]) -> usize {
+    let target: HashSet<&str> = target_tokens.iter().map(String::as_str).collect();
+    query_tokens
+        .iter()
+        .filter(|q| target.contains(q.as_str()))
+        .count()
+}
+
+fn compute_signals(skill: &Skill, query_tokens: &[String]) -> SkillSignals {
+    let name_tokens = normalized_tokens(&skill.name);
+    let summary_tokens = normalized_tokens(&skill.summary);
+    let tag_tokens: Vec<String> = skill
+        .keywords
+        .iter()
+        .flat_map(|k| normalized_tokens(k))
+        .collect();
+    let body_tokens = normalized_tokens(&skill.doc);
+
+    SkillSignals {
+        name_hits: overlap(query_tokens, &name_tokens),
+        summary_hits: overlap(query_tokens, &summary_tokens),
+        tag_hits: overlap(query_tokens, &tag_tokens),
+        body_hits: overlap(query_tokens, &body_tokens),
+    }
 }
 
 fn separator() -> String {
@@ -245,11 +359,36 @@ fn load_skill_md(path: &Path) -> Result<Option<Skill>> {
 
     let doc = body_lines.join("\n").trim().to_string();
 
+    let mut extra_docs = Vec::new();
+    if let Some(folder) = path.parent() {
+        let pattern = folder.join("*.md");
+        for entry in glob(pattern.to_str().unwrap())
+            .with_context(|| format!("Failed to glob extra markdown files in {}", folder.display()))?
+        {
+            let p = entry?;
+            if p.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase() == "skill.md")
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let contents = fs::read_to_string(&p)
+                .with_context(|| format!("Failed to read extra skill file {}", p.display()))?;
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "extra.md".into());
+            extra_docs.push(ExtraDoc { name, contents });
+        }
+        extra_docs.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
     Ok(Some(Skill {
         name: frontmatter.name,
         summary: frontmatter.description,
         keywords: frontmatter.tags,
         doc,
+        extra_docs,
     }))
 }
 
@@ -300,4 +439,12 @@ Only use skill playbooks found in: {}",
     for skill in skills {
         println!("- {} — {}", skill.name, skill.summary);
     }
+}
+
+fn clip_summary(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(limit).collect();
+    format!("{}...", clipped)
 }
