@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use glob::{glob, glob_with, MatchOptions};
-use include_dir::{include_dir, Dir};
+use glob::{MatchOptions, glob, glob_with};
+use include_dir::{Dir, include_dir};
 use serde::Deserialize;
 use serde_json;
 
@@ -13,7 +13,7 @@ use serde_json;
 #[command(name = "skills", about = "Route tasks to the right skill playbook.")]
 struct Cli {
     /// Directory containing skill folders (each with SKILL.md)
-    #[arg(long, default_value = "skills")]
+    #[arg(long, default_value = "skills", global = true)]
     skills_dir: PathBuf,
 
     #[command(subcommand)]
@@ -96,15 +96,26 @@ fn main() -> Result<()> {
 
     static EMBEDDED_SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/skills");
 
-    // Materialize bundled skills so agents don't need to locate this repo.
+    // Materialize bundled skills only when explicitly requested.
     if let Command::Init { force } = command {
         materialize_skills(&cli.skills_dir, force, &EMBEDDED_SKILLS_DIR)?;
         println!("Bundled skills written to {}", cli.skills_dir.display());
         return Ok(());
     }
 
-    materialize_skills(&cli.skills_dir, false, &EMBEDDED_SKILLS_DIR)?;
-    let skills = load_skills(&cli.skills_dir)?;
+    let fs_skills = if cli.skills_dir.exists() {
+        load_skills(&cli.skills_dir)?
+    } else {
+        Vec::new()
+    };
+
+    let mut skills = if fs_skills.is_empty() {
+        load_embedded_skills(&EMBEDDED_SKILLS_DIR)?
+    } else {
+        fs_skills
+    };
+
+    dedupe_skills(&mut skills);
 
     if skills.is_empty() {
         println!(
@@ -115,7 +126,12 @@ fn main() -> Result<()> {
     }
 
     match command {
-        Command::List { brief, verbose, json, clip } => {
+        Command::List {
+            brief,
+            verbose,
+            json,
+            clip,
+        } => {
             if json {
                 let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
                 let json = serde_json::to_string(&names)?;
@@ -150,7 +166,11 @@ fn main() -> Result<()> {
                     println!(
                         "No good skill match for '{}'. Try a broader or simpler description.\nHint: skills available: {}",
                         query,
-                        skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                        skills
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                     return Ok(());
                 }
@@ -175,17 +195,21 @@ fn main() -> Result<()> {
                     skill.summary
                 );
                 if show && idx == 0 {
-                    println!(
-                        "\n{}\n{}\n",
-                        separator(),
-                        skill.doc.trim()
-                    );
+                    println!("\n{}\n{}\n", separator(), skill.doc.trim());
                     println!(
                         "Top match reasoning: name hits={}, summary hits={}, tag hits={}, body hits={}",
-                        signals.name_hits, signals.summary_hits, signals.tag_hits, signals.body_hits
+                        signals.name_hits,
+                        signals.summary_hits,
+                        signals.tag_hits,
+                        signals.body_hits
                     );
                     for extra in &skill.extra_docs {
-                        println!("\n{} {}\n{}\n", separator(), extra.name, extra.contents.trim());
+                        println!(
+                            "\n{} {}\n{}\n",
+                            separator(),
+                            extra.name,
+                            extra.contents.trim()
+                        );
                     }
                     shown = true;
                 }
@@ -199,7 +223,12 @@ fn main() -> Result<()> {
             if let Some(skill) = find_skill(&skills, &name) {
                 println!("{}\n{}\n", separator(), skill.doc.trim());
                 for extra in &skill.extra_docs {
-                    println!("\n{} {}\n{}\n", separator(), extra.name, extra.contents.trim());
+                    println!(
+                        "\n{} {}\n{}\n",
+                        separator(),
+                        extra.name,
+                        extra.contents.trim()
+                    );
                 }
             } else {
                 println!(
@@ -241,8 +270,8 @@ impl SkillSignals {
 
 fn normalized_tokens(text: &str) -> Vec<String> {
     let stopwords: HashSet<&'static str> = [
-        "the", "a", "an", "to", "and", "or", "for", "into", "with", "when", "of",
-        "use", "be", "is", "are", "on", "in", "at", "this", "that",
+        "the", "a", "an", "to", "and", "or", "for", "into", "with", "when", "of", "use", "be",
+        "is", "are", "on", "in", "at", "this", "that",
     ]
     .into_iter()
     .collect();
@@ -309,7 +338,10 @@ fn load_skills(dir: &Path) -> Result<Vec<Skill>> {
         }
     }
 
-    // Deduplicate by name, keeping first occurrence
+    Ok(skills)
+}
+
+fn dedupe_skills(skills: &mut Vec<Skill>) {
     let mut seen = Vec::<String>::new();
     skills.retain(|s| {
         let lower = s.name.to_lowercase();
@@ -320,14 +352,47 @@ fn load_skills(dir: &Path) -> Result<Vec<Skill>> {
             true
         }
     });
-
-    Ok(skills)
 }
 
 fn load_skill_md(path: &Path) -> Result<Option<Skill>> {
     let raw_text = fs::read_to_string(path)
         .with_context(|| format!("Failed to read skill file {}", path.display()))?;
 
+    let extra_docs = if let Some(folder) = path.parent() {
+        load_extra_docs_fs(folder, path)?
+    } else {
+        Vec::new()
+    };
+
+    parse_skill(&raw_text, path.display().to_string(), extra_docs)
+}
+
+fn load_extra_docs_fs(folder: &Path, skill_path: &Path) -> Result<Vec<ExtraDoc>> {
+    let mut extra_docs = Vec::new();
+    let pattern = folder.join("*.md");
+    for entry in glob(pattern.to_str().unwrap()).with_context(|| {
+        format!(
+            "Failed to glob extra markdown files in {}",
+            folder.display()
+        )
+    })? {
+        let p = entry?;
+        if p == skill_path {
+            continue;
+        }
+        let contents = fs::read_to_string(&p)
+            .with_context(|| format!("Failed to read extra skill file {}", p.display()))?;
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "extra.md".into());
+        extra_docs.push(ExtraDoc { name, contents });
+    }
+    extra_docs.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(extra_docs)
+}
+
+fn parse_skill(raw_text: &str, origin: String, extra_docs: Vec<ExtraDoc>) -> Result<Option<Skill>> {
     // Expect frontmatter delimited by lines starting with ---
     let mut lines = raw_text.lines();
     let Some(first) = lines.next() else {
@@ -358,33 +423,9 @@ fn load_skill_md(path: &Path) -> Result<Option<Skill>> {
 
     let fm_str = fm_lines.join("\n");
     let frontmatter: SkillFrontmatter = serde_yaml::from_str(&fm_str)
-        .with_context(|| format!("Invalid YAML frontmatter in {}", path.display()))?;
+        .with_context(|| format!("Invalid YAML frontmatter in {}", origin))?;
 
     let doc = body_lines.join("\n").trim().to_string();
-
-    let mut extra_docs = Vec::new();
-    if let Some(folder) = path.parent() {
-        let pattern = folder.join("*.md");
-        for entry in glob(pattern.to_str().unwrap())
-            .with_context(|| format!("Failed to glob extra markdown files in {}", folder.display()))?
-        {
-            let p = entry?;
-            if p.file_name()
-                .map(|n| n.to_string_lossy().to_lowercase() == "skill.md")
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let contents = fs::read_to_string(&p)
-                .with_context(|| format!("Failed to read extra skill file {}", p.display()))?;
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "extra.md".into());
-            extra_docs.push(ExtraDoc { name, contents });
-        }
-        extra_docs.sort_by(|a, b| a.name.cmp(&b.name));
-    }
 
     Ok(Some(Skill {
         name: frontmatter.name,
@@ -393,6 +434,54 @@ fn load_skill_md(path: &Path) -> Result<Option<Skill>> {
         doc,
         extra_docs,
     }))
+}
+
+fn load_embedded_skills(dir: &Dir) -> Result<Vec<Skill>> {
+    fn walk(d: &Dir, skills: &mut Vec<Skill>) -> Result<()> {
+        let mut skill_md = None;
+        let mut extras: Vec<ExtraDoc> = Vec::new();
+
+        for file in d.files() {
+            let name = file
+                .path()
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if name.eq_ignore_ascii_case("SKILL.md") {
+                skill_md = Some(file);
+            } else if name.to_lowercase().ends_with(".md") {
+                if let Some(contents) = file.contents_utf8() {
+                    extras.push(ExtraDoc {
+                        name,
+                        contents: contents.to_string(),
+                    });
+                }
+            }
+        }
+
+        if let Some(skill_file) = skill_md {
+            if let Some(contents) = skill_file.contents_utf8() {
+                extras.sort_by(|a, b| a.name.cmp(&b.name));
+                if let Some(skill) = parse_skill(
+                    contents,
+                    format!("embedded:{}", skill_file.path().display()),
+                    extras,
+                )? {
+                    skills.push(skill);
+                }
+            }
+        }
+
+        for child in d.dirs() {
+            walk(child, skills)?;
+        }
+
+        Ok(())
+    }
+
+    let mut skills = Vec::new();
+    walk(dir, &mut skills)?;
+    Ok(skills)
 }
 
 fn find_skill<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {

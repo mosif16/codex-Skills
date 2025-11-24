@@ -16,10 +16,7 @@ fn pick(query: &str) -> String {
 #[test]
 fn picks_brainstorming_for_idea_refinement_queries() {
     let out = pick("refine rough idea into plan");
-    assert!(
-        out.contains("brainstorming"),
-        "output was: {out}"
-    );
+    assert!(out.contains("brainstorming"), "output was: {out}");
 }
 
 #[test]
@@ -33,21 +30,16 @@ fn falls_back_cleanly_when_no_match() {
         .arg("1")
         .arg("--show");
 
-    cmd.assert()
-        .success()
-        .stdout(
-            predicates::str::contains("No good skill match")
-                .or(predicates::str::contains("try a broader query")),
-        );
+    cmd.assert().success().stdout(
+        predicates::str::contains("No good skill match")
+            .or(predicates::str::contains("try a broader query")),
+    );
 }
 
 #[test]
 fn tags_and_summary_are_weighted_over_body() {
     let out = pick("frontend interface design");
-    assert!(
-        out.starts_with("1. frontend-design"),
-        "got: {out}"
-    );
+    assert!(out.starts_with("1. frontend-design"), "got: {out}");
 }
 
 #[test]
