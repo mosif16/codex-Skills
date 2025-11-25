@@ -1,9 +1,9 @@
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 
 #[test]
 fn default_list_is_clipped() {
-    let mut cmd = Command::cargo_bin("codex-skills").unwrap();
+    let mut cmd = cargo_bin_cmd!("codex-skills");
     cmd.arg("--skills-dir").arg("skills").arg("list");
     cmd.assert()
         .success()
@@ -13,7 +13,7 @@ fn default_list_is_clipped() {
 
 #[test]
 fn verbose_list_shows_full_summary() {
-    let mut cmd = Command::cargo_bin("codex-skills").unwrap();
+    let mut cmd = cargo_bin_cmd!("codex-skills");
     cmd.args(["--skills-dir", "skills", "list", "--verbose"]);
     cmd.assert()
         .success()
@@ -22,7 +22,7 @@ fn verbose_list_shows_full_summary() {
 
 #[test]
 fn json_list_returns_names_array() {
-    let mut cmd = Command::cargo_bin("codex-skills").unwrap();
+    let mut cmd = cargo_bin_cmd!("codex-skills");
     cmd.args(["--skills-dir", "skills", "list", "--json"]);
     cmd.assert()
         .success()

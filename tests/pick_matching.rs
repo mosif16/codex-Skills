@@ -1,8 +1,8 @@
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 
 fn pick(query: &str) -> String {
-    let mut cmd = Command::cargo_bin("codex-skills").unwrap();
+    let mut cmd = cargo_bin_cmd!("codex-skills");
     cmd.arg("--skills-dir")
         .arg("skills")
         .arg("pick")
@@ -21,7 +21,7 @@ fn picks_brainstorming_for_idea_refinement_queries() {
 
 #[test]
 fn falls_back_cleanly_when_no_match() {
-    let mut cmd = Command::cargo_bin("codex-skills").unwrap();
+    let mut cmd = cargo_bin_cmd!("codex-skills");
     cmd.arg("--skills-dir")
         .arg("skills")
         .arg("pick")
@@ -44,7 +44,7 @@ fn tags_and_summary_are_weighted_over_body() {
 
 #[test]
 fn pick_show_explains_why_top_skill_won() {
-    let mut cmd = Command::cargo_bin("codex-skills").unwrap();
+    let mut cmd = cargo_bin_cmd!("codex-skills");
     cmd.arg("--skills-dir")
         .arg("skills")
         .arg("pick")

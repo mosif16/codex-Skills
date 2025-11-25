@@ -1,9 +1,9 @@
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::str;
 
 #[test]
 fn pick_show_includes_additional_markdown_files() {
-    let mut cmd = Command::cargo_bin("codex-skills").unwrap();
+    let mut cmd = cargo_bin_cmd!("codex-skills");
     cmd.args([
         "--skills-dir",
         "skills",
