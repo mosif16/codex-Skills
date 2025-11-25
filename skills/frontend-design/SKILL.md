@@ -1,6 +1,6 @@
 ---
 name: product-frontend-design
-description: Review and design SaaS/product marketing sites and frontend interfaces end-to-end: clarify value, fix hierarchy, and implement distinctive, production-grade UI that avoids generic AI aesthetics.
+description: "Review and design SaaS/product marketing sites and frontend interfaces end-to-end: clarify value, fix hierarchy, and implement distinctive, production-grade UI that avoids generic AI aesthetics."
 version: "1.0.0"
 dependencies: []
 ---
