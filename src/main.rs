@@ -8,6 +8,7 @@ use glob::{MatchOptions, glob, glob_with};
 use include_dir::{Dir, include_dir};
 use serde::Deserialize;
 use serde_json;
+use strsim::jaro_winkler;
 
 #[derive(Parser, Debug)]
 #[command(name = "skills", about = "Route tasks to the right skill playbook.")]
@@ -152,36 +153,43 @@ fn main() -> Result<()> {
         }
         Command::Pick { query, top, show } => {
             let q_tokens = normalized_tokens(&query);
+            let query_phrase = query.to_lowercase();
             let mut ranked: Vec<(usize, &Skill, SkillSignals)> = skills
                 .iter()
                 .map(|s| {
-                    let signals = compute_signals(s, &q_tokens);
+                    let signals = compute_signals(s, &q_tokens, &query_phrase);
                     (signals.total_score(), s, signals)
                 })
                 .collect();
             ranked.sort_by(|a, b| b.0.cmp(&a.0));
 
-            if let Some((best_score, best_skill, _)) = ranked.first() {
+            if let Some((best_score, _best_skill, _)) = ranked.first() {
                 if *best_score == 0 {
+                    let mut closest: Vec<(f64, &str)> = skills
+                        .iter()
+                        .map(|s| {
+                            (
+                                jaro_winkler(&s.name.to_lowercase(), &query_phrase),
+                                s.name.as_str(),
+                            )
+                        })
+                        .filter(|(sim, _)| *sim > 0.0)
+                        .collect();
+                    closest
+                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let shortlist: Vec<&str> =
+                        closest.into_iter().take(5).map(|(_, n)| n).collect();
+
                     println!(
-                        "No good skill match for '{}'. Try a broader or simpler description.\nHint: skills available: {}",
+                        "No good skill match for '{}'. Try a broader or simpler description.\nClosest skill names: {}",
                         query,
-                        skills
-                            .iter()
-                            .map(|s| s.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        if shortlist.is_empty() {
+                            "(no close names found)".to_string()
+                        } else {
+                            shortlist.join(", ")
+                        }
                     );
                     return Ok(());
-                }
-                if show {
-                    println!(
-                        "Top match reasoning: name hits={}, summary hits={}, tag hits={}, body hits={}",
-                        compute_signals(best_skill, &q_tokens).name_hits,
-                        compute_signals(best_skill, &q_tokens).summary_hits,
-                        compute_signals(best_skill, &q_tokens).tag_hits,
-                        compute_signals(best_skill, &q_tokens).body_hits,
-                    );
                 }
             }
 
@@ -197,11 +205,14 @@ fn main() -> Result<()> {
                 if show && idx == 0 {
                     println!("\n{}\n{}\n", separator(), skill.doc.trim());
                     println!(
-                        "Top match reasoning: name hits={}, summary hits={}, tag hits={}, body hits={}",
+                        "Top match reasoning: name hits={}, summary hits={}, tag hits={}, body hits={}, phrase bonus={}, name similarity={}, summary similarity={}",
                         signals.name_hits,
                         signals.summary_hits,
                         signals.tag_hits,
-                        signals.body_hits
+                        signals.body_hits,
+                        signals.phrase_bonus,
+                        signals.name_similarity,
+                        signals.summary_similarity,
                     );
                     for extra in &skill.extra_docs {
                         println!(
@@ -252,6 +263,9 @@ struct SkillSignals {
     summary_hits: usize,
     tag_hits: usize,
     body_hits: usize,
+    phrase_bonus: usize,
+    name_similarity: usize,
+    summary_similarity: usize,
 }
 
 impl SkillSignals {
@@ -260,11 +274,17 @@ impl SkillSignals {
         const SUMMARY_WEIGHT: usize = 5;
         const TAG_WEIGHT: usize = 4;
         const BODY_WEIGHT: usize = 1;
+        const PHRASE_WEIGHT: usize = 1;
+        const NAME_SIM_WEIGHT: usize = 2;
+        const SUMMARY_SIM_WEIGHT: usize = 1;
 
         NAME_WEIGHT * self.name_hits
             + SUMMARY_WEIGHT * self.summary_hits
             + TAG_WEIGHT * self.tag_hits
             + BODY_WEIGHT * self.body_hits
+            + PHRASE_WEIGHT * self.phrase_bonus
+            + NAME_SIM_WEIGHT * self.name_similarity
+            + SUMMARY_SIM_WEIGHT * self.summary_similarity
     }
 }
 
@@ -297,7 +317,7 @@ fn overlap(query_tokens: &[String], target_tokens: &[String]) -> usize {
         .count()
 }
 
-fn compute_signals(skill: &Skill, query_tokens: &[String]) -> SkillSignals {
+fn compute_signals(skill: &Skill, query_tokens: &[String], query_phrase: &str) -> SkillSignals {
     let name_tokens = normalized_tokens(&skill.name);
     let summary_tokens = normalized_tokens(&skill.summary);
     let tag_tokens: Vec<String> = skill
@@ -307,11 +327,43 @@ fn compute_signals(skill: &Skill, query_tokens: &[String]) -> SkillSignals {
         .collect();
     let body_tokens = normalized_tokens(&skill.doc);
 
+    let base_hits = overlap(query_tokens, &name_tokens)
+        + overlap(query_tokens, &summary_tokens)
+        + overlap(query_tokens, &tag_tokens)
+        + overlap(query_tokens, &body_tokens);
+
+    let name_sim_raw = jaro_winkler(&skill.name.to_lowercase(), query_phrase);
+    let summary_sim_raw = jaro_winkler(&skill.summary.to_lowercase(), query_phrase);
+
+    // Only trust similarity when we also have token agreement or the match is very strong.
+    let similarity_gate = base_hits > 0 || name_sim_raw >= 0.92 || summary_sim_raw >= 0.94;
+    let name_similarity = if similarity_gate {
+        (name_sim_raw * 10.0).round() as usize
+    } else {
+        0
+    };
+    let summary_similarity = if similarity_gate {
+        (summary_sim_raw * 8.0).round() as usize
+    } else {
+        0
+    };
+
+    let phrase_bonus = if skill.name.to_lowercase().contains(query_phrase)
+        || skill.summary.to_lowercase().contains(query_phrase)
+    {
+        10
+    } else {
+        0
+    };
+
     SkillSignals {
         name_hits: overlap(query_tokens, &name_tokens),
         summary_hits: overlap(query_tokens, &summary_tokens),
         tag_hits: overlap(query_tokens, &tag_tokens),
         body_hits: overlap(query_tokens, &body_tokens),
+        phrase_bonus,
+        name_similarity,
+        summary_similarity,
     }
 }
 
