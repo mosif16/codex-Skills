@@ -1,17 +1,23 @@
-use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+//! codex-skills: Route tasks to the right skill playbook.
 
-use anyhow::{Context, Result};
+mod commands;
+mod config;
+mod loader;
+mod matching;
+mod skill;
+
+use std::path::PathBuf;
+
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use glob::{MatchOptions, glob, glob_with};
 use include_dir::{Dir, include_dir};
-use serde::Deserialize;
-use serde_json;
-use strsim::jaro_winkler;
+
+use commands::{cmd_instructions, cmd_list, cmd_pick, cmd_show};
+use config::Config;
+use loader::{load_skills_with_fallback, materialize_skills};
 
 #[derive(Parser, Debug)]
-#[command(name = "skills", about = "Route tasks to the right skill playbook.")]
+#[command(name = "codex-skills", about = "Route tasks to the right skill playbook.")]
 struct Cli {
     /// Directory containing skill folders (each with SKILL.md)
     #[arg(long, default_value = "skills", global = true)]
@@ -66,190 +72,97 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+
+    /// Validate skill files for correctness
+    Validate {
+        /// Fail on warnings (stricter validation)
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Show statistics about loaded skills
+    Stats,
+
+    /// Search within skill content
+    Search {
+        /// Text to search for in skill bodies
+        query: String,
+        /// Show context around matches
+        #[arg(long, short, default_value_t = 2)]
+        context: usize,
+    },
 }
 
-#[derive(Debug, Clone)]
-struct Skill {
-    name: String,
-    summary: String,
-    keywords: Vec<String>,
-    doc: String,
-    extra_docs: Vec<ExtraDoc>,
-}
-
-#[derive(Debug, Clone)]
-struct ExtraDoc {
-    name: String,
-    contents: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SkillFrontmatter {
-    name: String,
-    description: String,
-    #[serde(default)]
-    tags: Vec<String>,
-}
+/// Embedded skills directory, compiled into the binary.
+static EMBEDDED_SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/skills");
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let command = cli.command;
+    let config = Config::load();
 
-    static EMBEDDED_SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/skills");
+    // Use config for skills_dir if not overridden on command line
+    let skills_dir = if cli.skills_dir == PathBuf::from("skills") {
+        config.skills_dir.clone().unwrap_or(cli.skills_dir)
+    } else {
+        cli.skills_dir
+    };
 
-    // Materialize bundled skills only when explicitly requested.
-    if let Command::Init { force } = command {
-        materialize_skills(&cli.skills_dir, force, &EMBEDDED_SKILLS_DIR)?;
-        println!("Bundled skills written to {}", cli.skills_dir.display());
+    // Handle init command before loading skills
+    if let Command::Init { force } = cli.command {
+        materialize_skills(&skills_dir, force, &EMBEDDED_SKILLS_DIR)?;
+        println!("Bundled skills written to {}", skills_dir.display());
         return Ok(());
     }
 
-    let fs_skills = if cli.skills_dir.exists() {
-        load_skills(&cli.skills_dir)?
-    } else {
-        Vec::new()
-    };
-
-    let mut skills = if fs_skills.is_empty() {
-        load_embedded_skills(&EMBEDDED_SKILLS_DIR)?
-    } else {
-        fs_skills
-    };
-
-    dedupe_skills(&mut skills);
+    // Load skills with fallback to embedded
+    let skills = load_skills_with_fallback(&skills_dir, &EMBEDDED_SKILLS_DIR)?;
 
     if skills.is_empty() {
         println!(
             "No skills found in {}. Add SKILL.md files to get started.",
-            cli.skills_dir.display()
+            skills_dir.display()
         );
         return Ok(());
     }
 
-    match command {
+    match cli.command {
         Command::List {
             brief,
             verbose,
             json,
             clip,
         } => {
-            if json {
-                let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-                let json = serde_json::to_string(&names)?;
-                println!("{}", json);
-                return Ok(());
-            }
-
-            for skill in &skills {
-                if brief {
-                    println!("- {}", skill.name);
-                } else if verbose {
-                    println!("- {} — {}", skill.name, skill.summary);
-                } else {
-                    let clipped = clip_summary(&skill.summary, clip);
-                    println!("- {} — {}", skill.name, clipped);
-                }
-            }
+            // Use config clip length if default was used
+            let effective_clip = if clip == 80 {
+                config.get_clip_length()
+            } else {
+                clip
+            };
+            cmd_list(&skills, brief, verbose, json, effective_clip);
         }
         Command::Pick { query, top, show } => {
-            let q_tokens = normalized_tokens(&query);
-            let query_phrase = query.to_lowercase();
-            let mut ranked: Vec<(usize, &Skill, SkillSignals)> = skills
-                .iter()
-                .map(|s| {
-                    let signals = compute_signals(s, &q_tokens, &query_phrase);
-                    (signals.total_score(), s, signals)
-                })
-                .collect();
-            ranked.sort_by(|a, b| b.0.cmp(&a.0));
-
-            if let Some((best_score, _best_skill, _)) = ranked.first() {
-                if *best_score == 0 {
-                    let mut closest: Vec<(f64, &str)> = skills
-                        .iter()
-                        .map(|s| {
-                            (
-                                jaro_winkler(&s.name.to_lowercase(), &query_phrase),
-                                s.name.as_str(),
-                            )
-                        })
-                        .filter(|(sim, _)| *sim > 0.0)
-                        .collect();
-                    closest
-                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                    let shortlist: Vec<&str> =
-                        closest.into_iter().take(5).map(|(_, n)| n).collect();
-
-                    println!(
-                        "No good skill match for '{}'. Try a broader or simpler description.\nClosest skill names: {}",
-                        query,
-                        if shortlist.is_empty() {
-                            "(no close names found)".to_string()
-                        } else {
-                            shortlist.join(", ")
-                        }
-                    );
-                    return Ok(());
-                }
-            }
-
-            let mut shown = false;
-            for (idx, (score, skill, signals)) in ranked.iter().take(top).enumerate() {
-                println!(
-                    "{}. {} (score: {}) — {}",
-                    idx + 1,
-                    skill.name,
-                    score,
-                    skill.summary
-                );
-                if show && idx == 0 {
-                    println!("\n{}\n{}\n", separator(), skill.doc.trim());
-                    println!(
-                        "Top match reasoning: name hits={}, summary hits={}, tag hits={}, body hits={}, phrase bonus={}, name similarity={}, summary similarity={}",
-                        signals.name_hits,
-                        signals.summary_hits,
-                        signals.tag_hits,
-                        signals.body_hits,
-                        signals.phrase_bonus,
-                        signals.name_similarity,
-                        signals.summary_similarity,
-                    );
-                    for extra in &skill.extra_docs {
-                        println!(
-                            "\n{} {}\n{}\n",
-                            separator(),
-                            extra.name,
-                            extra.contents.trim()
-                        );
-                    }
-                    shown = true;
-                }
-            }
-
-            if show && !shown {
-                println!("No matches to display; try a broader query.");
-            }
+            // Use config top value if default was used
+            let effective_top = if top == 3 {
+                config.get_default_top()
+            } else {
+                top
+            };
+            cmd_pick(&skills, &query, effective_top, show);
         }
         Command::Show { name } => {
-            if let Some(skill) = find_skill(&skills, &name) {
-                println!("{}\n{}\n", separator(), skill.doc.trim());
-                for extra in &skill.extra_docs {
-                    println!(
-                        "\n{} {}\n{}\n",
-                        separator(),
-                        extra.name,
-                        extra.contents.trim()
-                    );
-                }
-            } else {
-                println!(
-                    "Skill '{}' not found. Use `skills list` to see available entries.",
-                    name
-                );
-            }
+            cmd_show(&skills, &name);
         }
         Command::Instructions => {
-            print_instructions(&skills, &cli.skills_dir);
+            cmd_instructions(&skills, &skills_dir);
+        }
+        Command::Validate { strict } => {
+            cmd_validate(&skills, strict);
+        }
+        Command::Stats => {
+            cmd_stats(&skills);
+        }
+        Command::Search { query, context } => {
+            cmd_search(&skills, &query, context);
         }
         Command::Init { .. } => unreachable!(),
     }
@@ -257,338 +170,196 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Default)]
-struct SkillSignals {
-    name_hits: usize,
-    summary_hits: usize,
-    tag_hits: usize,
-    body_hits: usize,
-    phrase_bonus: usize,
-    name_similarity: usize,
-    summary_similarity: usize,
-}
+/// Execute the `validate` command.
+fn cmd_validate(skills: &[skill::Skill], strict: bool) {
+    let mut errors = 0;
+    let mut warnings = 0;
 
-impl SkillSignals {
-    fn total_score(&self) -> usize {
-        const NAME_WEIGHT: usize = 8;
-        const SUMMARY_WEIGHT: usize = 5;
-        const TAG_WEIGHT: usize = 4;
-        const BODY_WEIGHT: usize = 1;
-        const PHRASE_WEIGHT: usize = 1;
-        const NAME_SIM_WEIGHT: usize = 2;
-        const SUMMARY_SIM_WEIGHT: usize = 1;
-
-        NAME_WEIGHT * self.name_hits
-            + SUMMARY_WEIGHT * self.summary_hits
-            + TAG_WEIGHT * self.tag_hits
-            + BODY_WEIGHT * self.body_hits
-            + PHRASE_WEIGHT * self.phrase_bonus
-            + NAME_SIM_WEIGHT * self.name_similarity
-            + SUMMARY_SIM_WEIGHT * self.summary_similarity
-    }
-}
-
-fn normalized_tokens(text: &str) -> Vec<String> {
-    let stopwords: HashSet<&'static str> = [
-        "the", "a", "an", "to", "and", "or", "for", "into", "with", "when", "of", "use", "be",
-        "is", "are", "on", "in", "at", "this", "that",
-    ]
-    .into_iter()
-    .collect();
-
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter_map(|w| {
-            let word = w.trim();
-            if word.is_empty() || stopwords.contains(word) {
-                None
-            } else {
-                Some(word.to_string())
-            }
-        })
-        .collect()
-}
-
-fn overlap(query_tokens: &[String], target_tokens: &[String]) -> usize {
-    let target: HashSet<&str> = target_tokens.iter().map(String::as_str).collect();
-    query_tokens
-        .iter()
-        .filter(|q| target.contains(q.as_str()))
-        .count()
-}
-
-fn compute_signals(skill: &Skill, query_tokens: &[String], query_phrase: &str) -> SkillSignals {
-    let name_tokens = normalized_tokens(&skill.name);
-    let summary_tokens = normalized_tokens(&skill.summary);
-    let tag_tokens: Vec<String> = skill
-        .keywords
-        .iter()
-        .flat_map(|k| normalized_tokens(k))
-        .collect();
-    let body_tokens = normalized_tokens(&skill.doc);
-
-    let base_hits = overlap(query_tokens, &name_tokens)
-        + overlap(query_tokens, &summary_tokens)
-        + overlap(query_tokens, &tag_tokens)
-        + overlap(query_tokens, &body_tokens);
-
-    let name_sim_raw = jaro_winkler(&skill.name.to_lowercase(), query_phrase);
-    let summary_sim_raw = jaro_winkler(&skill.summary.to_lowercase(), query_phrase);
-
-    // Only trust similarity when we also have token agreement or the match is very strong.
-    let similarity_gate = base_hits > 0 || name_sim_raw >= 0.92 || summary_sim_raw >= 0.94;
-    let name_similarity = if similarity_gate {
-        (name_sim_raw * 10.0).round() as usize
-    } else {
-        0
-    };
-    let summary_similarity = if similarity_gate {
-        (summary_sim_raw * 8.0).round() as usize
-    } else {
-        0
-    };
-
-    let phrase_bonus = if skill.name.to_lowercase().contains(query_phrase)
-        || skill.summary.to_lowercase().contains(query_phrase)
-    {
-        10
-    } else {
-        0
-    };
-
-    SkillSignals {
-        name_hits: overlap(query_tokens, &name_tokens),
-        summary_hits: overlap(query_tokens, &summary_tokens),
-        tag_hits: overlap(query_tokens, &tag_tokens),
-        body_hits: overlap(query_tokens, &body_tokens),
-        phrase_bonus,
-        name_similarity,
-        summary_similarity,
-    }
-}
-
-fn separator() -> String {
-    "-".repeat(40)
-}
-
-fn load_skills(dir: &Path) -> Result<Vec<Skill>> {
-    let mut skills = Vec::new();
-
-    // Anthropic skills: **/SKILL.md (case-insensitive-ish)
-    let md_pattern = dir.join("**").join("SKILL.md");
-    let glob_options = MatchOptions {
-        case_sensitive: false,
-        require_literal_separator: true,
-        require_literal_leading_dot: false,
-    };
-    for entry in glob_with(md_pattern.to_str().unwrap(), glob_options)
-        .with_context(|| "Failed to read glob for SKILL.md (case-insensitive)")?
-    {
-        let path = entry?;
-        if let Some(skill) = load_skill_md(&path)? {
-            skills.push(skill);
-        }
-    }
-
-    Ok(skills)
-}
-
-fn dedupe_skills(skills: &mut Vec<Skill>) {
-    let mut seen = Vec::<String>::new();
-    skills.retain(|s| {
-        let lower = s.name.to_lowercase();
-        if seen.contains(&lower) {
-            false
-        } else {
-            seen.push(lower);
-            true
-        }
-    });
-}
-
-fn load_skill_md(path: &Path) -> Result<Option<Skill>> {
-    let raw_text = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read skill file {}", path.display()))?;
-
-    let extra_docs = if let Some(folder) = path.parent() {
-        load_extra_docs_fs(folder, path)?
-    } else {
-        Vec::new()
-    };
-
-    parse_skill(&raw_text, path.display().to_string(), extra_docs)
-}
-
-fn load_extra_docs_fs(folder: &Path, skill_path: &Path) -> Result<Vec<ExtraDoc>> {
-    let mut extra_docs = Vec::new();
-    let pattern = folder.join("*.md");
-    for entry in glob(pattern.to_str().unwrap()).with_context(|| {
-        format!(
-            "Failed to glob extra markdown files in {}",
-            folder.display()
-        )
-    })? {
-        let p = entry?;
-        if p == skill_path {
-            continue;
-        }
-        let contents = fs::read_to_string(&p)
-            .with_context(|| format!("Failed to read extra skill file {}", p.display()))?;
-        let name = p
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "extra.md".into());
-        extra_docs.push(ExtraDoc { name, contents });
-    }
-    extra_docs.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(extra_docs)
-}
-
-fn parse_skill(raw_text: &str, origin: String, extra_docs: Vec<ExtraDoc>) -> Result<Option<Skill>> {
-    // Expect frontmatter delimited by lines starting with ---
-    let mut lines = raw_text.lines();
-    let Some(first) = lines.next() else {
-        return Ok(None);
-    };
-    if first.trim() != "---" {
-        return Ok(None);
-    }
-
-    let mut fm_lines = Vec::new();
-    let mut body_lines = Vec::new();
-    let mut in_body = false;
-    for line in lines {
-        if !in_body && line.trim() == "---" {
-            in_body = true;
-            continue;
-        }
-        if in_body {
-            body_lines.push(line);
-        } else {
-            fm_lines.push(line);
-        }
-    }
-
-    if !in_body {
-        return Ok(None);
-    }
-
-    let fm_str = fm_lines.join("\n");
-    let frontmatter: SkillFrontmatter = serde_yaml::from_str(&fm_str)
-        .with_context(|| format!("Invalid YAML frontmatter in {}", origin))?;
-
-    let doc = body_lines.join("\n").trim().to_string();
-
-    Ok(Some(Skill {
-        name: frontmatter.name,
-        summary: frontmatter.description,
-        keywords: frontmatter.tags,
-        doc,
-        extra_docs,
-    }))
-}
-
-fn load_embedded_skills(dir: &Dir) -> Result<Vec<Skill>> {
-    fn walk(d: &Dir, skills: &mut Vec<Skill>) -> Result<()> {
-        let mut skill_md = None;
-        let mut extras: Vec<ExtraDoc> = Vec::new();
-
-        for file in d.files() {
-            let name = file
-                .path()
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if name.eq_ignore_ascii_case("SKILL.md") {
-                skill_md = Some(file);
-            } else if name.to_lowercase().ends_with(".md") {
-                if let Some(contents) = file.contents_utf8() {
-                    extras.push(ExtraDoc {
-                        name,
-                        contents: contents.to_string(),
-                    });
-                }
-            }
-        }
-
-        if let Some(skill_file) = skill_md {
-            if let Some(contents) = skill_file.contents_utf8() {
-                extras.sort_by(|a, b| a.name.cmp(&b.name));
-                if let Some(skill) = parse_skill(
-                    contents,
-                    format!("embedded:{}", skill_file.path().display()),
-                    extras,
-                )? {
-                    skills.push(skill);
-                }
-            }
-        }
-
-        for child in d.dirs() {
-            walk(child, skills)?;
-        }
-
-        Ok(())
-    }
-
-    let mut skills = Vec::new();
-    walk(dir, &mut skills)?;
-    Ok(skills)
-}
-
-fn find_skill<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
-    let needle = name.to_lowercase();
-    skills
-        .iter()
-        .find(|s| s.name.to_lowercase() == needle || s.name.to_lowercase().contains(&needle))
-}
-
-fn materialize_skills(dir: &Path, force: bool, embedded_dir: &Dir) -> Result<()> {
-    if !dir.exists() {
-        fs::create_dir_all(dir)?;
-    }
-
-    // include_dir's files() is non-recursive; walk the tree manually so nested skill folders are written.
-    fn write_dir(to: &Path, force: bool, d: &Dir) -> Result<()> {
-        for file in d.files() {
-            let target = to.join(file.path());
-            if target.exists() && !force {
-                continue;
-            }
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&target, file.contents())?;
-        }
-        for child in d.dirs() {
-            write_dir(to, force, child)?;
-        }
-        Ok(())
-    }
-
-    write_dir(dir, force, embedded_dir)
-}
-
-fn print_instructions(skills: &[Skill], skills_dir: &Path) {
-    println!(
-        "STRICT INSTRUCTIONS FOR AGENTS\n{}
-Only use skill playbooks found in: {}",
-        separator(),
-        skills_dir.display()
-    );
-    println!(
-        "1) The only allowed skills are listed below; do NOT invent new skills.\n2) Always pick the best-matching skill before acting; if none fit, say so.\n3) When using a skill, follow its playbook text verbatim; do not alter or remove steps.\n4) Cite the skill name when responding (e.g., 'Using skill: <name>').\n5) Do not read or write files outside the skills directory."
-    );
-    println!("{}\nALLOWED SKILLS:", separator());
     for skill in skills {
-        println!("- {} — {}", skill.name, skill.summary);
+        let mut skill_warnings = Vec::new();
+        let mut skill_errors = Vec::new();
+
+        // Check name
+        if skill.name.is_empty() {
+            skill_errors.push("Missing name".to_string());
+        } else if skill.name.contains(' ') {
+            skill_warnings.push("Name contains spaces (consider using kebab-case)".to_string());
+        }
+
+        // Check description
+        if skill.summary.is_empty() {
+            skill_errors.push("Missing description".to_string());
+        } else if skill.summary.len() > 200 {
+            skill_warnings.push(format!(
+                "Description is {} chars (recommended: <200)",
+                skill.summary.len()
+            ));
+        }
+
+        // Check tags
+        if skill.keywords.is_empty() {
+            skill_warnings.push("No tags defined (recommended: 3+)".to_string());
+        } else if skill.keywords.len() < 3 {
+            skill_warnings.push(format!(
+                "Only {} tag(s) (recommended: 3+)",
+                skill.keywords.len()
+            ));
+        }
+
+        // Check body content
+        if skill.doc.is_empty() {
+            skill_errors.push("Empty skill body".to_string());
+        } else if skill.doc.len() < 100 {
+            skill_warnings.push("Very short skill body (<100 chars)".to_string());
+        }
+
+        // Report issues
+        if !skill_errors.is_empty() || !skill_warnings.is_empty() {
+            println!("\n{}", skill.name);
+            for err in &skill_errors {
+                println!("  ✗ ERROR: {}", err);
+                errors += 1;
+            }
+            for warn in &skill_warnings {
+                println!("  ⚠ WARNING: {}", warn);
+                warnings += 1;
+            }
+        }
+    }
+
+    println!("\n{} skills validated", skills.len());
+    println!("  {} errors, {} warnings", errors, warnings);
+
+    if errors > 0 || (strict && warnings > 0) {
+        std::process::exit(1);
     }
 }
 
-fn clip_summary(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
+/// Execute the `stats` command.
+fn cmd_stats(skills: &[skill::Skill]) {
+    println!("Skill Statistics");
+    println!("{}", "-".repeat(40));
+    println!("Total skills: {}", skills.len());
+
+    // Find largest skill
+    if let Some(largest) = skills.iter().max_by_key(|s| s.doc.len()) {
+        println!(
+            "Largest skill: {} ({} chars, {} extra docs)",
+            largest.name,
+            largest.doc.len(),
+            largest.extra_docs.len()
+        );
     }
-    let clipped: String = text.chars().take(limit).collect();
-    format!("{}...", clipped)
+
+    // Find smallest skill
+    if let Some(smallest) = skills.iter().min_by_key(|s| s.doc.len()) {
+        println!(
+            "Smallest skill: {} ({} chars)",
+            smallest.name,
+            smallest.doc.len()
+        );
+    }
+
+    // Count total extra docs
+    let total_extra_docs: usize = skills.iter().map(|s| s.extra_docs.len()).sum();
+    println!("Total extra docs: {}", total_extra_docs);
+
+    // Average doc size
+    let avg_size: usize = skills.iter().map(|s| s.doc.len()).sum::<usize>() / skills.len().max(1);
+    println!("Average skill size: {} chars", avg_size);
+
+    // Count skills with tags
+    let with_tags = skills.iter().filter(|s| !s.keywords.is_empty()).count();
+    println!("Skills with tags: {}/{}", with_tags, skills.len());
+
+    // List all unique tags
+    let mut all_tags: Vec<&str> = skills
+        .iter()
+        .flat_map(|s| s.keywords.iter().map(|k| k.as_str()))
+        .collect();
+    all_tags.sort();
+    all_tags.dedup();
+    println!("Unique tags: {}", all_tags.len());
+
+    if !all_tags.is_empty() {
+        println!("\nTags: {}", all_tags.join(", "));
+    }
+}
+
+/// Execute the `search` command.
+fn cmd_search(skills: &[skill::Skill], query: &str, context_lines: usize) {
+    let query_lower = query.to_lowercase();
+    let mut total_matches = 0;
+
+    for skill in skills {
+        let mut skill_matches = Vec::new();
+
+        // Search in main doc
+        for (line_num, line) in skill.doc.lines().enumerate() {
+            if line.to_lowercase().contains(&query_lower) {
+                skill_matches.push((line_num, line.to_string(), "doc"));
+            }
+        }
+
+        // Search in extra docs
+        for extra in &skill.extra_docs {
+            for (line_num, line) in extra.contents.lines().enumerate() {
+                if line.to_lowercase().contains(&query_lower) {
+                    skill_matches.push((line_num, line.to_string(), extra.name.as_str()));
+                }
+            }
+        }
+
+        if !skill_matches.is_empty() {
+            println!("\n{} ({} matches)", skill.name, skill_matches.len());
+            println!("{}", "-".repeat(40));
+
+            for (line_num, line, source) in &skill_matches {
+                let source_prefix = if *source == "doc" {
+                    String::new()
+                } else {
+                    format!("[{}] ", source)
+                };
+                println!("  {}L{}: {}", source_prefix, line_num + 1, line.trim());
+
+                // Show context if requested
+                if context_lines > 0 {
+                    let doc_content = if *source == "doc" {
+                        &skill.doc
+                    } else {
+                        skill
+                            .extra_docs
+                            .iter()
+                            .find(|e| e.name.as_str() == *source)
+                            .map(|e| &e.contents)
+                            .unwrap_or(&skill.doc)
+                    };
+
+                    let lines: Vec<&str> = doc_content.lines().collect();
+                    let start = line_num.saturating_sub(context_lines);
+                    let end = (*line_num + context_lines + 1).min(lines.len());
+
+                    if start < *line_num || end > *line_num + 1 {
+                        for i in start..end {
+                            if i != *line_num {
+                                println!("    L{}: {}", i + 1, lines[i].trim());
+                            }
+                        }
+                    }
+                }
+            }
+            total_matches += skill_matches.len();
+        }
+    }
+
+    if total_matches == 0 {
+        println!("No matches found for '{}'", query);
+    } else {
+        println!("\n{} total matches across {} skills", total_matches,
+            skills.iter().filter(|s| {
+                s.doc.to_lowercase().contains(&query_lower) ||
+                s.extra_docs.iter().any(|e| e.contents.to_lowercase().contains(&query_lower))
+            }).count()
+        );
+    }
 }

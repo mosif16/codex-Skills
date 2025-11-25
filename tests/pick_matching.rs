@@ -39,7 +39,7 @@ fn falls_back_cleanly_when_no_match() {
 #[test]
 fn tags_and_summary_are_weighted_over_body() {
     let out = pick("frontend interface design");
-    assert!(out.starts_with("1. frontend-design"), "got: {out}");
+    assert!(out.starts_with("1. product-frontend-design"), "got: {out}");
 }
 
 #[test]
